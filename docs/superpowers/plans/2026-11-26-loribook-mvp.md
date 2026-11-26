@@ -23,6 +23,7 @@
 - An output rule can be `secret`. A secret output is kept in memory for the run only, passed to later steps through the environment, never stored, and scrubbed from all captured output including its producer's. A step with a secret output runs if and only if the run starts at or before it, or a step at or after the starting step uses the secret (the pull-in rule, with a secret setter always counting as having no valid value); its check is the verdict after the script. A secret never marks steps stale.
 - The sandbox is default-deny. In the MVP network is all or nothing per step (bubblewrap cannot filter by host); a host allowlist is deferred and must say so wherever network is declared.
 - No run state in git; `.lori_history/` is added to `.gitignore`.
+- The step catalog is a folder of YAML entries: one shipped and embedded in the binary, one belonging to the user (`$XDG_CONFIG_HOME/lori/catalog`, default `~/.config/lori/catalog`). Adding an entry copies its steps into the runbook, which owns them and records `source: <name>@<version>`; editing the catalog never changes existing runbooks. `catalog add` appends text (comments survive) and requires `steps:` to be the last key.
 - Never commit data from the worked example (a client's names, ids, hostnames). Fixtures are synthetic.
 - One active run per store (an advisory lock on the history directory).
 
@@ -51,6 +52,8 @@ crates/loribook-core/src/
   runner.rs                        Runner trait, StepRequest, StepOutcome, verdict and output rules
   creds.rs                         CredentialProvider trait, env/command/prompt providers, scrub()
   engine.rs                        Operator trait, run orchestration
+  catalog.rs                       Catalog, CatalogEntry, textual add to a runbook file
+catalog/azure/acquire-azure-cli-token.yaml   first shipped catalog entry (embedded with include_str!)
 crates/loribook-wartlog/src/lib.rs WartLogStore: RunStore over wartlog-store
 crates/loribook-sandbox/src/lib.rs BwrapRunner and LocalRunner
 crates/lori-cli/src/main.rs        `lori` binary, terminal Operator
@@ -105,6 +108,7 @@ pub struct Step {
   pub needs: Vec<String>, pub credentials: Vec<String>, pub network: bool, pub mounts: Vec<Mount>,
   pub expect: Expect, pub outputs: Vec<OutputRule>, pub timeout_secs: Option<u64>,
   pub target: Option<Target>,                          // None = the runbook's default
+  pub source: Option<String>,                          // "<catalog name>@<version>" when copied from the catalog
 }
 pub struct Runbook { pub name: String, pub target: Target /* default */, pub steps: Vec<Step>, pub hash: String /* sha256 hex of the file bytes */ }
 impl Runbook { pub fn target_of(&self, s: &Step) -> Target; }   // step override, else runbook default
@@ -286,7 +290,7 @@ pub enum EngineError { UnknownStep(String), Locked, Validation(Vec<Diagnostic>) 
 ```
 Behavior per step kind: Script: run check; passes → `StepVerified`, skip; fails → (approve if `approve`, with the rendered `plan`) → run script → run check again; both the script verdict and the re-check must pass. CheckOnly: run check, record. Question: skip silently when a non-secret value exists (from a previous run or the `default`... a design-time `default` counts as present); else `ask`; a secret question is asked every run. Manual: `attest`. Gate: `approve`, always, even in Auto mode. `RunMode::CheckOnly` runs every check, changes nothing, prompts nothing, and never calls `approve` or `ask`. `from` records every earlier step `StepSkipped`; if the starting step needs a variable with no valid value, show the `plan_pull_in` list and call `approve` once before running the pulled-in steps. A failed step calls `retry_choice`. The run first fails with `Validation` if `analyze` has any error diagnostic. A changed answer appends `StepMarkedStale` for dependents. A step with a secret output rule: when it is at or after the start step, or a step at or after the start step uses the variable (then it is pulled in, with the plan shown and approval asked like any pull-in), run its script first (no pre-check), extract the value from the raw output, add it to the run's in-memory secret set, scrub the output with the full secret set, then append events; the check runs afterwards as the verdict. `check_all` also runs such scripts (check mode must still never call `approve` or `ask`) and says so in its output. Every `StepStarted` carries the step's target; an approval's plan text includes it.
 
-- [ ] **Step 1: Write failing tests using `MemoryStore`, `ScriptedRunner` and a `ScriptedOperator`:** `all_checks_pass_runs_no_scripts`; `failing_check_runs_script_then_rechecks`; `recheck_failure_fails_step_and_asks_retry_choice`; `check_only_never_approves_or_asks`; `from_step_records_earlier_as_skipped_not_verified`; `from_unknown_step_is_error`; `from_pulls_in_setter_after_approval` (step 3 uses var from step 1; `from=3` → plan shows step 1, runs it first; declined → run does not start); `answered_question_skipped_on_second_run`; `secret_question_asked_every_run`; `design_time_default_counts_as_value`; `gate_requires_approval_even_in_auto`; `approval_event_records_plan_text`; `changed_answer_marks_dependents_stale`; `hash_recorded_on_run_started`; `secret_output_reaches_later_step_env_and_is_not_stored`; `secret_producer_at_or_after_start_runs_even_if_unused`; `secret_producer_before_start_is_pulled_in_when_a_later_step_uses_it`; `secret_producer_before_start_and_unused_is_skipped_by_choice`; `secret_producer_pull_in_declined_does_not_start_the_run`; `secret_output_scrubbed_from_producers_own_output` (the runner echoes the token; no stored event contains it); `secret_change_never_marks_stale`; `started_event_records_target`; `validation_errors_block_the_run`; `second_run_in_same_store_while_first_open_is_locked` (uses a store that reports a lock).
+- [ ] **Step 1: Write failing tests using `MemoryStore`, `ScriptedRunner` and a `ScriptedOperator`:** `all_checks_pass_runs_no_scripts`; `failing_check_runs_script_then_rechecks`; `recheck_failure_fails_step_and_asks_retry_choice`; `check_only_never_approves_or_asks`; `from_step_records_earlier_as_skipped_not_verified`; `from_unknown_step_is_error`; `from_pulls_in_setter_after_approval` (step 3 uses var from step 1; `from=3` → plan shows step 1, runs it first; declined → run does not start); `answered_question_skipped_on_second_run`; `secret_question_asked_every_run`; `design_time_default_counts_as_value`; `gate_requires_approval_even_in_auto`; `approval_event_records_plan_text`; `changed_answer_marks_dependents_stale`; `hash_recorded_on_run_started`; `secret_output_reaches_later_step_env_and_is_not_stored`; `secret_producer_at_or_after_start_runs_even_if_unused`; `secret_producer_before_start_is_pulled_in_when_a_later_step_uses_it`; `secret_producer_before_start_and_unused_is_skipped_by_choice`; `secret_producer_pull_in_declined_does_not_start_the_run`; `secret_output_scrubbed_from_producers_own_output` (the runner echoes the token; no stored event contains it); `secret_change_never_marks_stale`; `started_event_records_target`; `check_all_runs_secret_producers_and_reports_each_one`; `validation_errors_block_the_run`; `second_run_in_same_store_while_first_open_is_locked` (uses a store that reports a lock).
 - [ ] **Step 2: Run; expect failure.** **Step 3: Implement `run`, `check_all` and `plan_pull_in`; one private function per step kind.** **Step 4: Run; expect PASS.**
 - [ ] **Step 5: Commit** `feat(core): run orchestration`.
 
@@ -337,7 +341,7 @@ Command shape: `bwrap --unshare-all [--share-net if req.network] --die-with-pare
 
 If `bwrap` is missing in the build environment, run `apt-get install -y bubblewrap`; if user namespaces are blocked there, the sandbox tests are marked `#[ignore]` with a reason and sandbox-target steps fail with that reason while local-target steps still run, which must be stated in the commit message.
 
-- [ ] **Step 1: Write failing tests (skip with a printed reason when `detect()` errs):** `runs_script_and_captures_output`; `exit_code_is_returned`; `no_network_by_default` (a script that tries `/dev/tcp/127.0.0.1/1` fails when `network=false`); `cannot_read_home` (`ls $HOME` shows nothing from the host); `cannot_write_outside_tmp_and_mounts`; `rw_mount_is_writable_ro_mount_is_not`; `env_is_cleared_except_declared` (a host variable is absent; a declared one present; a secret in `secret_env` present); `secret_not_in_process_arguments` (`ps` or `/proc/self/cmdline` inside the sandbox never shows it); `timeout_kills_the_process_group` (`sleep 60 & wait`, timeout 1 s, outcome `TimedOut`, no stray `sleep` afterward); `missing_needs_tool_fails_before_script`; `huge_output_is_capped` (200 MiB of `yes`). `LocalRunner` tests: `local_inherits_operator_environment`; `local_gets_injected_secret_env`; `local_secret_not_in_argv`; `local_timeout_kills_the_process_group`; `local_output_is_capped`; `default_router_sends_local_steps_to_local_even_without_bwrap`.
+- [ ] **Step 1: Write failing tests (skip with a printed reason when `detect()` errs):** `runs_script_and_captures_output`; `exit_code_is_returned`; `no_network_by_default` (a script that tries `/dev/tcp/127.0.0.1/1` fails when `network=false`); `cannot_read_home` (`ls $HOME` shows nothing from the host); `cannot_write_outside_tmp_and_mounts`; `rw_mount_is_writable_ro_mount_is_not`; `env_is_cleared_except_declared` (a host variable is absent; a declared one present; a secret in `secret_env` present); `secret_not_in_process_arguments` (`ps` or `/proc/self/cmdline` inside the sandbox never shows it); `timeout_kills_the_process_group` (`sleep 60 & wait`, timeout 1 s, outcome `TimedOut`, no stray `sleep` afterward); `missing_needs_tool_fails_before_script`; `huge_output_is_capped` (200 MiB of `yes`). `LocalRunner` tests: `local_inherits_operator_environment`; `local_gets_injected_secret_env`; `local_secret_not_in_argv`; `local_timeout_kills_the_process_group`; `local_output_is_capped`; `local_missing_needs_tool_fails_before_script`; `default_router_sends_local_steps_to_local_even_without_bwrap`.
 - [ ] **Step 2: Run; expect failure.** **Step 3: Implement with `std::process::Command`, a `setsid` process group, a reader thread, and a deadline loop.** **Step 4: Run; expect PASS (or the documented skips).**
 - [ ] **Step 5: Commit** `feat(sandbox): bubblewrap runner`.
 
@@ -366,7 +370,63 @@ If `bwrap` is missing in the build environment, run `apt-get install -y bubblewr
 
 ---
 
-### Task 11: Acceptance test from the worked example
+### Task 11: Minimal step catalog
+
+**Files:**
+- Create: `crates/loribook-core/src/catalog.rs`, `catalog/azure/acquire-azure-cli-token.yaml`
+- Modify: `crates/lori-cli/src/main.rs` (the `catalog` subcommand)
+- Test: `crates/loribook-core/tests/catalog.rs`, `crates/lori-cli/tests/catalog_cli.rs`
+
+**Interfaces:**
+- Consumes: `Step`, `Runbook`, `parse_runbook`, `analyze` (Tasks 2, 3).
+- Produces:
+```rust
+pub struct CatalogEntry { pub name: String, pub title: String, pub version: u32, pub description: String, pub steps: Vec<Step> }
+pub enum Origin { Shipped, User }
+pub struct Catalog { /* entries with their origin; a user entry shadows a shipped one of the same name */ }
+impl Catalog {
+  pub fn shipped() -> Catalog;                                  // embedded entries
+  pub fn load(user_dir: Option<&Path>) -> anyhow::Result<Catalog>;   // shipped plus every *.yaml under user_dir
+  pub fn list(&self) -> Vec<(&CatalogEntry, Origin)>;           // shipped order, user entries after
+  pub fn get(&self, name: &str) -> Option<&CatalogEntry>;
+}
+pub fn render_steps(entry: &CatalogEntry) -> String;            // YAML list items with `source: name@version` set, ready to paste under `steps:`
+pub fn add_to_file(runbook_text: &str, entry: &CatalogEntry) -> Result<String, CatalogError>;
+pub enum CatalogError { StepsNotLast, IdCollision(String), Parse(String) }
+```
+`add_to_file` appends `render_steps` at the end of the text, drops any question step whose variable already has a setter in the runbook, and refuses with `IdCollision` when a step id already exists. Everything above the appended text is returned unchanged byte for byte.
+
+The shipped entry, exact content:
+```yaml
+name: acquire-azure-cli-token
+title: Acquire Azure CLI Token
+version: 1
+description: Gets an access token from the signed-in Azure CLI and keeps it as a secret for later steps.
+steps:
+  - id: azure-token-resource
+    kind: question
+    label: Token resource
+    question: { var: AZ_TOKEN_RESOURCE, ty: text, default: "https://management.azure.com/", placeholder: the resource (audience) the token is for }
+  - id: acquire-azure-cli-token
+    label: Acquire Azure CLI Token
+    description: Runs on this machine as you, using your existing az login session. The token is never stored.
+    target: local
+    needs: [az]
+    script: |
+      az account get-access-token --resource "${AZ_TOKEN_RESOURCE}" --output json
+    outputs:
+      - { var: AZ_ACCESS_TOKEN, secret: true, rule: { json_path: accessToken } }
+    check: |
+      az account show --query id --output tsv
+```
+
+- [ ] **Step 1: Write failing tests:** `shipped_catalog_lists_acquire_azure_cli_token_first`; `shipped_entry_validates` (a runbook made from the entry's steps plus one step that uses `${AZ_ACCESS_TOKEN}` has no error diagnostics); `render_steps_sets_source`; `add_appends_and_preserves_existing_text_byte_for_byte` (a runbook with comments); `add_skips_question_whose_variable_already_has_a_setter`; `add_refuses_when_steps_is_not_the_last_key` (`StepsNotLast`); `add_refuses_duplicate_step_id` (`IdCollision`); `user_entry_shadows_shipped_entry_and_is_listed_after`; `user_dir_missing_is_not_an_error`. CLI: `catalog_list_prints_name_title_version_origin`; `catalog_show_prints_the_yaml`; `catalog_add_writes_the_file`; `catalog_add_unknown_name_exits_2`.
+- [ ] **Step 2: Run; expect failure.** **Step 3: Implement; embed the shipped entry with `include_str!`; find "`steps:` is last" with a line scan for top-level keys.** **Step 4: Run; expect PASS.**
+- [ ] **Step 5: Commit** `feat: minimal step catalog with Acquire Azure CLI Token`.
+
+---
+
+### Task 12: Acceptance test from the worked example
 
 **Files:**
 - Create: `crates/lori-cli/tests/fixtures/infra.lori` (default `target: local` so the stubs on `PATH` are visible; synthetic, 12 to 15 steps shaped like the worked example: preflight, create environment, create identity, role assignments, DNS records, variables, pipeline registration, a waiting "has the run finished?" manual step, a tag push, certificate creation, a final by-hand checklist), `crates/lori-cli/tests/fixtures/bin/{az,git,curl,dig}` (stubs that keep their "cloud" in a state directory), `crates/lori-cli/tests/acceptance.rs`
@@ -374,14 +434,14 @@ If `bwrap` is missing in the build environment, run `apt-get install -y bubblewr
 
 **Interfaces:** consumes the `lori` binary. No client names, ids or hostnames in any fixture.
 
-- [ ] **Step 1: Write the acceptance tests, one per line of spec section 10:** `rerun_with_all_checks_passing_runs_no_scripts`; `failing_check_runs_step_then_rechecks`; `check_command_changes_nothing_and_asks_nothing`; `start_at_late_step_pulls_in_the_setter` (the fixture has a late step using a variable set by an early question); `changing_a_variable_stales_exactly_its_dependents`; `injected_credential_present_in_env_absent_from_history_and_args` (credential via `--cred TOKEN='echo s3cret-value'`; grep the whole `.lori_history` directory bytes for the value: absent); `undeclared_network_is_denied` (needs the real sandbox; ignored with reason when unavailable); `token_from_secret_output_reaches_later_step_and_is_absent_from_history` (the stub `az account get-access-token` prints JSON; an `outputs` rule with `secret: true` and a JSON path takes `accessToken`; a later step uses `${TOKEN}` and echoes it; the whole `.lori_history` directory contains neither the token nor the echoed value); `sandbox_only_refuses_the_fixture_because_it_uses_local`; `kill_mid_run_then_resume` (SIGKILL the `lori` process during a step; rerun; history is intact and the run resumes from the first failing check).
+- [ ] **Step 1: Write the acceptance tests, one per line of spec section 10:** `rerun_with_all_checks_passing_runs_no_scripts`; `failing_check_runs_step_then_rechecks`; `check_command_changes_nothing_and_asks_nothing`; `start_at_late_step_pulls_in_the_setter` (the fixture has a late step using a variable set by an early question); `changing_a_variable_stales_exactly_its_dependents`; `injected_credential_present_in_env_absent_from_history_and_args` (credential via `--cred TOKEN='echo s3cret-value'`; grep the whole `.lori_history` directory bytes for the value: absent); `undeclared_network_is_denied` (needs the real sandbox; ignored with reason when unavailable); `token_from_secret_output_reaches_later_step_and_is_absent_from_history` (the fixture's token step is added with `lori catalog add` from the shipped `acquire-azure-cli-token` entry; the stub `az account get-access-token` prints JSON; a later step uses `${TOKEN}` and echoes it; the whole `.lori_history` directory contains neither the token nor the echoed value); `sandbox_only_refuses_the_fixture_because_it_uses_local`; `kill_mid_run_then_resume` (SIGKILL the `lori` process during a step; rerun; history is intact and the run resumes from the first failing check).
 - [ ] **Step 2: Build the fixture and stubs until each test fails for the right reason, then until it passes.** Record in the mapping note every idiom that was awkward (shared helper functions, multi-part steps, waiting steps), as input to phase 2.
 - [ ] **Step 3: `cargo test --workspace`; expect PASS** (sandbox-dependent tests may be skipped with the printed reason; say which in the note).
 - [ ] **Step 4: Commit** `test: acceptance suite from the worked example`.
 
 ---
 
-### Task 12: Finish
+### Task 13: Finish
 
 **Files:**
 - Create: `README.md` (what LoriBook is, build, a 20-line example runbook, the commands, the sandbox model and its MVP limits: Linux only, network all-or-nothing, host toolchain, one active run per store)
@@ -395,7 +455,7 @@ If `bwrap` is missing in the build environment, run `apt-get install -y bubblewr
 
 ## Self-Review
 
-**Spec coverage.** Intent and checks-first (Task 7); start from any step and skipped-by-choice (Task 7); questions and variables with the "skip when present" rule (Tasks 3, 7); derived dependencies, used-before-set, stale (Tasks 3, 4); sandbox default-deny and per-step declarations (Task 9); credential injection and scrubbing (Task 8); append-only WartLog history in `.lori_history`, hash per run, store trait, spike (Tasks 1, 4, 5, 7); phases (Task 10 is phase 1 only); acceptance list (Task 11). Spec gap noted: host allowlist egress is not implementable with bubblewrap alone, so Task 9 makes network all-or-nothing and the Global Constraints record the limit; the spec's wording ("ideally an allowlist") already allows it. Spec's Open items 1 (substitution syntax) and 4 (large output) are settled here as my calls; 2 by Task 1.
+**Spec coverage.** Intent and checks-first (Task 7); start from any step and skipped-by-choice (Task 7); questions and variables with the "skip when present" rule (Tasks 3, 7); derived dependencies, used-before-set, stale (Tasks 3, 4); sandbox default-deny and per-step declarations (Task 9); credential injection and scrubbing (Task 8); append-only WartLog history in `.lori_history`, hash per run, store trait, spike (Tasks 1, 4, 5, 7); phases (Task 10 is phase 1 only); acceptance list (Task 12), minimal catalog (Task 11). Spec gap noted: host allowlist egress is not implementable with bubblewrap alone, so Task 9 makes network all-or-nothing and the Global Constraints record the limit; the spec's wording ("ideally an allowlist") already allows it. Spec's Open items 1 (substitution syntax) and 4 (large output) are settled here as my calls; 2 by Task 1.
 
 **Step scan.** Each step names a test list, a signature, or a command. Bodies are left to the implementer except the bubblewrap command shape, which the signature does not determine.
 
