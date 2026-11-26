@@ -1,6 +1,6 @@
 # LoriBook Design
 
-Status: draft for Tim's approval, 2026-11-26.
+Status: approved by Tim, 2026-11-26 (scope and history location confirmed).
 Owner: Tim (tmcqueen)
 Sources: the LoriBook design doc and the Runbooks spec (both Claude artifacts), a worked example (`dev-admin-setup.sh`, 21 steps, not to be implemented as is), the WartLog repository and its library design (PR 7), and the design conversation of 2026-11-26.
 
@@ -131,9 +131,9 @@ A step kind is one of: script step, question step, check-only step (no script), 
 
 ## 8. Storage
 
-- Definitions are YAML files on the file system. Run state is never written back to them (Decided).
+- A runbook is a YAML file named `<name>.lori` on the file system (the `.lori` extension is Tim's, the YAML content is my call). Run state is never written back to it (Decided).
 - The history is an append-only WartLog store, created as `external` and owned by LoriBook alone. One process writes it (My call: one active run per store in the MVP).
-- Store location is a `.lori/` directory next to the runbook, so a runbook and its history travel together and the directory stays out of git (My call).
+- Store location (Decided): for the MVP, a `.lori_history` directory next to the runbook file, so a runbook and its history travel together and the directory stays out of git. Later the location becomes a property inside the runbook file itself (`<filename>.lori`), with `.lori_history` as the default.
 - A run is modeled as a trace and a step attempt as a span, with output as log records carrying `run`, `step`, `attempt` and `kind` attributes (My call, **unverified**). The first piece of work is a short spike that confirms the query planner answers "every attempt of step X in runbook Y" without scanning the store. If it does not, the fallback is the trait with a different backend, and the format of the events does not change.
 - Current state of a run is derived from its events and cached in memory. It is not read back from the log on every screen refresh.
 - Event kinds: run started, step started, check result, script output, output value extracted, answer recorded, approval recorded, attestation recorded, step ended with verdict, run ended, stale marked. Nothing is ever edited. A step that goes stale is a new event.
