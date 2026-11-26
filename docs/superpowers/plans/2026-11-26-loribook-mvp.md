@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A Linux `lori` CLI that runs `.lori` runbooks (checks first, start from any step, questions that create variables, approvals) in a bubblewrap sandbox with injected credentials, and records every attempt in an append-only WartLog history in `.lori_history`.
+**Goal:** A Linux `lori` CLI that runs `.lori` runbooks (checks first, start from any step, questions that create variables, approvals) in a bubblewrap sandbox by default (or on the local machine when a step says `target: local`) with injected credentials, and records every attempt in an append-only WartLog history in `.lori_history`.
 
 **Architecture:** A pure core crate (model, variables, dependency and stale logic, events, run orchestration) with three plug-in traits: `RunStore` (WartLog), `Runner` (sandbox) and `Operator` (the terminal). The CLI is a thin shell. Task 1 is a spike that decides whether WartLog can answer the history queries; the trait keeps the backend swappable.
 
@@ -19,6 +19,8 @@
 - Dependencies are derived from variable use, never declared. `${foo}` is environment substitution; `${{foo}}` is exact (pasted) substitution; a secret variable allows only `${foo}`. `$${` writes a literal `${` (my call, spec item Open 1).
 - A step is one (check, action) pair. Every script step and check-only step has a required `check`.
 - A skipped-by-choice step is never shown as passed. Starting a run never approves an approval step.
+- Steps run on a target: `sandbox` (default) or `local` (this machine, as the operator, environment inherited, no isolation). A runbook sets a default target; a step may override it. `network` and `mounts` on a `local` step are a validation error. `lori run --sandbox-only` refuses any non-sandbox target. The target is recorded on every attempt and shown in approvals. SSH is out of the MVP.
+- An output rule can be `secret`. A secret output is kept in memory for the run only, passed to later steps through the environment, never stored, and scrubbed from all captured output including its producer's. A step with a secret output runs its script on every run in which it or a later step uses the variable; its check is the verdict after the script. A secret never marks steps stale.
 - The sandbox is default-deny. In the MVP network is all or nothing per step (bubblewrap cannot filter by host); a host allowlist is deferred and must say so wherever network is declared.
 - No run state in git; `.lori_history/` is added to `.gitignore`.
 - Never commit data from the worked example (a client's names, ids, hostnames). Fixtures are synthetic.
@@ -29,7 +31,7 @@
 1. A runbook with no steps, duplicate step ids, or a `--from` naming a step that does not exist: a clear error, not a panic (Task 2, Task 7).
 2. A script that prints a huge amount of output, or invalid UTF-8: capture is capped at 1 MiB per attempt with a visible truncation marker, and bad bytes are replaced, never a crash (Task 6).
 3. A script that hangs, or the operator pressing Ctrl-C mid-step: the step has a timeout (default 600 s), the sandbox process group is killed, and the attempt ends as `interrupted` or `timed_out`, never left open (Task 6, Task 9).
-4. An injected secret that is split across two reads of the output, or appears inside a longer line: scrubbed whenever it occurs in the final captured text (Task 8).
+4. An injected secret that is split across two reads of the output, or appears inside a longer line, or is extracted from the very output that contains it (a token printed by its own producer): scrubbed whenever it occurs in the final captured text, before anything is stored (Tasks 7, 8).
 5. The runbook file is edited between runs: the run records a content hash, and history for a step shows which attempts came from an earlier version (Task 7).
 
 ---
@@ -50,7 +52,7 @@ crates/loribook-core/src/
   creds.rs                         CredentialProvider trait, env/command/prompt providers, scrub()
   engine.rs                        Operator trait, run orchestration
 crates/loribook-wartlog/src/lib.rs WartLogStore: RunStore over wartlog-store
-crates/loribook-sandbox/src/lib.rs BwrapRunner (and HostRunner for tests)
+crates/loribook-sandbox/src/lib.rs BwrapRunner and LocalRunner
 crates/lori-cli/src/main.rs        `lori` binary, terminal Operator
 crates/lori-cli/tests/             acceptance test and fixtures
 spikes/wartlog-mapping/            throwaway spike (Task 1)
@@ -95,20 +97,23 @@ pub struct Mount { pub path: String, pub writable: bool }
 pub struct Expect { pub exit: i32, pub pattern: Option<String>, pub lines: Vec<String> }  // default exit 0
 pub struct OutputRule { pub var: String, pub secret: bool, pub rule: Extract }
 pub enum Extract { Regex(String), AfterMarker(String), JsonPath(String) }
+pub enum Target { Sandbox, Local }                     // default Sandbox; yaml: `target: sandbox|local`
 pub struct Step {
   pub id: StepId, pub label: String, pub description: String, pub plan: Option<String>,
   pub kind: StepKind, pub question: Option<Question>,
   pub check: Option<String>, pub script: Option<String>, pub approve: bool,
   pub needs: Vec<String>, pub credentials: Vec<String>, pub network: bool, pub mounts: Vec<Mount>,
   pub expect: Expect, pub outputs: Vec<OutputRule>, pub timeout_secs: Option<u64>,
+  pub target: Option<Target>,                          // None = the runbook's default
 }
-pub struct Runbook { pub name: String, pub steps: Vec<Step>, pub hash: String /* sha256 hex of the file bytes */ }
+pub struct Runbook { pub name: String, pub target: Target /* default */, pub steps: Vec<Step>, pub hash: String /* sha256 hex of the file bytes */ }
+impl Runbook { pub fn target_of(&self, s: &Step) -> Target; }   // step override, else runbook default
 pub fn parse_runbook(bytes: &[u8]) -> Result<Runbook, ModelError>;
-pub enum ModelError { Yaml(String), Empty, DuplicateId(String), MissingCheck(String), MissingQuestion(String), BadKind(String) }
+pub enum ModelError { Yaml(String), Empty, DuplicateId(String), MissingCheck(String), MissingQuestion(String), BadKind(String), BadTarget(String), SandboxFieldOnLocal(String) /* step id */ }
 ```
 YAML field names are the lowercase field names above; `kind` defaults to `script`.
 
-- [ ] **Step 1: Write failing tests in `tests/model.rs`:** `parses_minimal_runbook` (one script step with check and script, hash is 64 hex chars); `rejects_empty_runbook` (`ModelError::Empty`); `rejects_duplicate_ids` (`DuplicateId("a")`); `script_step_requires_check` (`MissingCheck("a")`); `question_step_requires_question_block` (`MissingQuestion`); `gate_and_question_need_no_check`.
+- [ ] **Step 1: Write failing tests in `tests/model.rs`:** `parses_minimal_runbook` (one script step with check and script, hash is 64 hex chars); `rejects_empty_runbook` (`ModelError::Empty`); `rejects_duplicate_ids` (`DuplicateId("a")`); `script_step_requires_check` (`MissingCheck("a")`); `question_step_requires_question_block` (`MissingQuestion`); `gate_and_question_need_no_check`; `step_target_overrides_runbook_default`; `unknown_target_rejected` (`BadTarget`); `local_step_with_mounts_or_network_is_rejected` (`SandboxFieldOnLocal`).
 - [ ] **Step 2: Run `cargo test -p loribook-core --test model`; expect compile failure.**
 - [ ] **Step 3: Implement `parse_runbook` in `model.rs` with serde derive and a validation pass.** The hash is over the raw bytes.
 - [ ] **Step 4: Run the tests; expect PASS.**
@@ -166,7 +171,7 @@ pub struct RunId(pub String);                         // uuid v7 text
 pub struct Event { pub seq: u64 /*0 until stored*/, pub ts_ns: i64, pub run: RunId, pub kind: EventKind }
 pub enum EventKind {
   RunStarted { runbook_hash: String, mode: RunMode, from: Option<StepId> },
-  StepStarted { step: StepId, attempt: u32 },
+  StepStarted { step: StepId, attempt: u32, target: Target },
   CheckResult { step: StepId, attempt: u32, passed: bool, exit: i32, output: String },
   ScriptResult { step: StepId, attempt: u32, exit: i32, output: String, ended: Ended, verdict: bool },
   ValueExtracted { step: StepId, var: String, value: Option<String> },  // None for a secret
@@ -237,7 +242,7 @@ impl WartLogStore { pub fn open(dir: &Path) -> anyhow::Result<WartLogStore>; }  
 - Consumes: `Step`, `Expect`, `OutputRule` (Task 2).
 - Produces:
 ```rust
-pub struct StepRequest { pub script: String, pub env: BTreeMap<String,String>, pub secret_env: BTreeMap<String,String>,
+pub struct StepRequest { pub target: Target, pub script: String, pub env: BTreeMap<String,String>, pub secret_env: BTreeMap<String,String>,
                          pub network: bool, pub mounts: Vec<Mount>, pub needs: Vec<String>, pub timeout: Duration }
 pub struct StepOutcome { pub exit: i32, pub output: String /* already scrubbed and capped */, pub ended: Ended }
 pub trait Runner { fn run(&mut self, req: &StepRequest) -> anyhow::Result<StepOutcome>; }
@@ -245,10 +250,11 @@ pub const MAX_OUTPUT_BYTES: usize = 1_048_576;
 pub fn cap_output(raw: &[u8]) -> (String, bool);                     // lossy UTF-8; appends "\n[output truncated at 1 MiB]" when cut
 pub fn verdict(exp: &Expect, o: &StepOutcome) -> bool;               // exit matches AND pattern (regex) found AND every line in `lines` present
 pub fn extract(rule: &Extract, output: &str) -> Result<String, ExtractError>;  // exactly one value, else Err(NoMatch | Ambiguous)
-pub struct ScriptedRunner { /* test double: maps script text or substring → StepOutcome, records requests */ }
+pub struct Router { pub sandbox: Box<dyn Runner>, pub local: Box<dyn Runner> }   // impl Runner: dispatches on req.target
+pub struct ScriptedRunner { /* test double: maps script text or substring → StepOutcome, records requests (including target) */ }
 ```
 
-- [ ] **Step 1: Write failing tests:** `verdict_defaults_to_exit_zero`; `verdict_requires_pattern_and_lines`; `extract_regex_one_capture`; `extract_zero_matches_is_error_not_blank`; `extract_two_matches_is_ambiguous`; `extract_after_marker`; `extract_json_path` (`a.b[0]`); `cap_output_truncates_and_marks`; `cap_output_replaces_invalid_utf8`; `scripted_runner_records_requests`.
+- [ ] **Step 1: Write failing tests:** `verdict_defaults_to_exit_zero`; `verdict_requires_pattern_and_lines`; `extract_regex_one_capture`; `extract_zero_matches_is_error_not_blank`; `extract_two_matches_is_ambiguous`; `extract_after_marker`; `extract_json_path` (`a.b[0]`); `cap_output_truncates_and_marks`; `cap_output_replaces_invalid_utf8`; `scripted_runner_records_requests`; `router_dispatches_on_target`.
 - [ ] **Step 2: Run; expect failure.** **Step 3: Implement; `extract` JSON path via `serde_json` pointer-style parsing.** **Step 4: Run; expect PASS.**
 - [ ] **Step 5: Commit** `feat(core): runner trait, verdicts, extraction`.
 
@@ -278,9 +284,9 @@ pub fn check_all<S: RunStore, R: Runner>(rb: &Runbook, store: &mut S, runner: &m
 pub fn plan_pull_in(rb: &Runbook, a: &Analysis, state: &RunState, from: &StepId) -> Result<Vec<StepId>, EngineError>; // setters needed with no valid value, in order
 pub enum EngineError { UnknownStep(String), Locked, Validation(Vec<Diagnostic>) }
 ```
-Behavior per step kind: Script: run check; passes → `StepVerified`, skip; fails → (approve if `approve`, with the rendered `plan`) → run script → run check again; both the script verdict and the re-check must pass. CheckOnly: run check, record. Question: skip silently when a non-secret value exists (from a previous run or the `default`... a design-time `default` counts as present); else `ask`; a secret question is asked every run. Manual: `attest`. Gate: `approve`, always, even in Auto mode. `RunMode::CheckOnly` runs every check, changes nothing, prompts nothing, and never calls `approve` or `ask`. `from` records every earlier step `StepSkipped`; if the starting step needs a variable with no valid value, show the `plan_pull_in` list and call `approve` once before running the pulled-in steps. A failed step calls `retry_choice`. The run first fails with `Validation` if `analyze` has any error diagnostic. A changed answer appends `StepMarkedStale` for dependents.
+Behavior per step kind: Script: run check; passes → `StepVerified`, skip; fails → (approve if `approve`, with the rendered `plan`) → run script → run check again; both the script verdict and the re-check must pass. CheckOnly: run check, record. Question: skip silently when a non-secret value exists (from a previous run or the `default`... a design-time `default` counts as present); else `ask`; a secret question is asked every run. Manual: `attest`. Gate: `approve`, always, even in Auto mode. `RunMode::CheckOnly` runs every check, changes nothing, prompts nothing, and never calls `approve` or `ask`. `from` records every earlier step `StepSkipped`; if the starting step needs a variable with no valid value, show the `plan_pull_in` list and call `approve` once before running the pulled-in steps. A failed step calls `retry_choice`. The run first fails with `Validation` if `analyze` has any error diagnostic. A changed answer appends `StepMarkedStale` for dependents. A step with a secret output rule: when it or a later step in the run window uses the variable, run its script first (no pre-check), extract the value from the raw output, add it to the run's in-memory secret set, scrub the output with the full secret set, then append events; the check runs afterwards as the verdict. `check_all` also runs such scripts (check mode must still never call `approve` or `ask`) and says so in its output. Every `StepStarted` carries the step's target; an approval's plan text includes it.
 
-- [ ] **Step 1: Write failing tests using `MemoryStore`, `ScriptedRunner` and a `ScriptedOperator`:** `all_checks_pass_runs_no_scripts`; `failing_check_runs_script_then_rechecks`; `recheck_failure_fails_step_and_asks_retry_choice`; `check_only_never_approves_or_asks`; `from_step_records_earlier_as_skipped_not_verified`; `from_unknown_step_is_error`; `from_pulls_in_setter_after_approval` (step 3 uses var from step 1; `from=3` → plan shows step 1, runs it first; declined → run does not start); `answered_question_skipped_on_second_run`; `secret_question_asked_every_run`; `design_time_default_counts_as_value`; `gate_requires_approval_even_in_auto`; `approval_event_records_plan_text`; `changed_answer_marks_dependents_stale`; `hash_recorded_on_run_started`; `validation_errors_block_the_run`; `second_run_in_same_store_while_first_open_is_locked` (uses a store that reports a lock).
+- [ ] **Step 1: Write failing tests using `MemoryStore`, `ScriptedRunner` and a `ScriptedOperator`:** `all_checks_pass_runs_no_scripts`; `failing_check_runs_script_then_rechecks`; `recheck_failure_fails_step_and_asks_retry_choice`; `check_only_never_approves_or_asks`; `from_step_records_earlier_as_skipped_not_verified`; `from_unknown_step_is_error`; `from_pulls_in_setter_after_approval` (step 3 uses var from step 1; `from=3` → plan shows step 1, runs it first; declined → run does not start); `answered_question_skipped_on_second_run`; `secret_question_asked_every_run`; `design_time_default_counts_as_value`; `gate_requires_approval_even_in_auto`; `approval_event_records_plan_text`; `changed_answer_marks_dependents_stale`; `hash_recorded_on_run_started`; `secret_output_reaches_later_step_env_and_is_not_stored`; `secret_output_step_runs_every_run`; `secret_output_scrubbed_from_producers_own_output` (the runner echoes the token; no stored event contains it); `secret_change_never_marks_stale`; `started_event_records_target`; `validation_errors_block_the_run`; `second_run_in_same_store_while_first_open_is_locked` (uses a store that reports a lock).
 - [ ] **Step 2: Run; expect failure.** **Step 3: Implement `run`, `check_all` and `plan_pull_in`; one private function per step kind.** **Step 4: Run; expect PASS.**
 - [ ] **Step 5: Commit** `feat(core): run orchestration`.
 
@@ -305,13 +311,13 @@ pub fn scrub(text: &str, secrets: &[&str]) -> String;            // replaces eve
 ```
 Wire into the engine: before a step, resolve each name in `step.credentials`, place them in `secret_env` (upper-cased name) and collect them for `scrub`; scrub `output` before any event is built. A secret question's answer goes to `secret_env` too.
 
-- [ ] **Step 1: Write failing tests:** `env_provider_reads_prefixed_var`; `command_provider_trims_stdout`; `chain_falls_through_then_errors_with_name`; `scrub_replaces_all_occurrences`; `scrub_handles_secret_inside_longer_line`; `scrub_longest_first` (one secret contains another); `scrub_ignores_tiny_values`; `engine_never_stores_injected_secret` (a `ScriptedRunner` echoes the secret; after the run, no stored event contains it and `StepRequest.script` does not contain it); `unknown_credential_fails_step_with_name_not_value`.
+- [ ] **Step 1: Write failing tests:** `env_provider_reads_prefixed_var`; `command_provider_trims_stdout`; `chain_falls_through_then_errors_with_name`; `scrub_replaces_all_occurrences`; `scrub_handles_secret_inside_longer_line`; `scrub_longest_first` (one secret contains another); `scrub_ignores_tiny_values`; `engine_never_stores_injected_secret` (a `ScriptedRunner` echoes the secret; after the run, no stored event contains it and `StepRequest.script` does not contain it); `unknown_credential_fails_step_with_name_not_value`; `secret_added_mid_run_is_scrubbed_from_later_output` (a value extracted in step 1 is redacted in step 2's stored output).
 - [ ] **Step 2: Run; expect failure.** **Step 3: Implement; sort secrets by length descending in `scrub`.** **Step 4: Run; expect PASS.**
 - [ ] **Step 5: Commit** `feat(core): credential providers and output scrubbing`.
 
 ---
 
-### Task 9: The bubblewrap sandbox runner
+### Task 9: The bubblewrap sandbox runner and the local runner
 
 **Files:**
 - Create: `crates/loribook-sandbox/Cargo.toml`, `src/lib.rs`
@@ -324,13 +330,14 @@ Wire into the engine: before a step, resolve each name in `step.credentials`, pl
 pub struct BwrapRunner { pub bwrap: PathBuf, pub shell: PathBuf /* default /bin/bash */ }
 impl BwrapRunner { pub fn detect() -> anyhow::Result<BwrapRunner>; }   // Err with install hint when bwrap is missing or user namespaces are blocked
 impl Runner for BwrapRunner {}
-pub struct HostRunner;   // unsandboxed, used only by tests and `lori --no-sandbox` (prints a warning every run)
+pub struct LocalRunner;  // target: local. `bash -c <script>` on this machine as the operator; inherits the environment, then adds `env` and `secret_env`; same timeout, process-group kill and output cap; no isolation
+pub fn default_router() -> Router;   // LocalRunner always; BwrapRunner if `detect()` works, otherwise a sandbox runner that fails every step with the install hint
 ```
 Command shape: `bwrap --unshare-all [--share-net if req.network] --die-with-parent --new-session --ro-bind /usr /usr --ro-bind /etc /etc (plus /bin /lib /lib64 symlinks) --proc /proc --dev /dev --tmpfs /tmp --chdir /tmp`, one `--bind`/`--ro-bind` per mount, `--clearenv` then `--setenv` for each env entry, then `bash -c <script>`. Preflight each name in `needs` with `which` inside the sandbox view; a missing tool is a failed outcome naming the tool, before the script runs. Timeout: kill the whole process group, `ended = TimedOut`. Output: stdout and stderr merged, capped by `cap_output`.
 
-If `bwrap` is missing in the build environment, run `apt-get install -y bubblewrap`; if user namespaces are blocked there, the sandbox tests are marked `#[ignore]` with a reason and `lori` refuses to run without `--no-sandbox`, which must be stated in the commit message.
+If `bwrap` is missing in the build environment, run `apt-get install -y bubblewrap`; if user namespaces are blocked there, the sandbox tests are marked `#[ignore]` with a reason and sandbox-target steps fail with that reason while local-target steps still run, which must be stated in the commit message.
 
-- [ ] **Step 1: Write failing tests (skip with a printed reason when `detect()` errs):** `runs_script_and_captures_output`; `exit_code_is_returned`; `no_network_by_default` (a script that tries `/dev/tcp/127.0.0.1/1` fails when `network=false`); `cannot_read_home` (`ls $HOME` shows nothing from the host); `cannot_write_outside_tmp_and_mounts`; `rw_mount_is_writable_ro_mount_is_not`; `env_is_cleared_except_declared` (a host variable is absent; a declared one present; a secret in `secret_env` present); `secret_not_in_process_arguments` (`ps` or `/proc/self/cmdline` inside the sandbox never shows it); `timeout_kills_the_process_group` (`sleep 60 & wait`, timeout 1 s, outcome `TimedOut`, no stray `sleep` afterward); `missing_needs_tool_fails_before_script`; `huge_output_is_capped` (200 MiB of `yes`).
+- [ ] **Step 1: Write failing tests (skip with a printed reason when `detect()` errs):** `runs_script_and_captures_output`; `exit_code_is_returned`; `no_network_by_default` (a script that tries `/dev/tcp/127.0.0.1/1` fails when `network=false`); `cannot_read_home` (`ls $HOME` shows nothing from the host); `cannot_write_outside_tmp_and_mounts`; `rw_mount_is_writable_ro_mount_is_not`; `env_is_cleared_except_declared` (a host variable is absent; a declared one present; a secret in `secret_env` present); `secret_not_in_process_arguments` (`ps` or `/proc/self/cmdline` inside the sandbox never shows it); `timeout_kills_the_process_group` (`sleep 60 & wait`, timeout 1 s, outcome `TimedOut`, no stray `sleep` afterward); `missing_needs_tool_fails_before_script`; `huge_output_is_capped` (200 MiB of `yes`). `LocalRunner` tests: `local_inherits_operator_environment`; `local_gets_injected_secret_env`; `local_secret_not_in_argv`; `local_timeout_kills_the_process_group`; `local_output_is_capped`; `default_router_sends_local_steps_to_local_even_without_bwrap`.
 - [ ] **Step 2: Run; expect failure.** **Step 3: Implement with `std::process::Command`, a `setsid` process group, a reader thread, and a deadline loop.** **Step 4: Run; expect PASS (or the documented skips).**
 - [ ] **Step 5: Commit** `feat(sandbox): bubblewrap runner`.
 
@@ -347,13 +354,13 @@ If `bwrap` is missing in the build environment, run `apt-get install -y bubblewr
 - Produces: the `lori` binary:
   - `lori validate <file.lori>`: diagnostics, exit 1 on any error.
   - `lori check <file.lori>`: no changes, no prompts, exit 1 if any check fails.
-  - `lori run <file.lori> [--from <id>] [--auto] [--no-sandbox] [--cred NAME=cmd...]`: runs and prompts.
+  - `lori run <file.lori> [--from <id>] [--auto] [--sandbox-only] [--cred NAME=cmd...]`: runs and prompts. `--sandbox-only` exits 2 before running anything if any step's target is not `sandbox`.
   - `lori status <file.lori>`: one line per step (`pending`, `verified`, `succeeded`, `answered`, `attested`, `skipped`, `failed`, `stale`) from the latest run.
   - `lori history <file.lori> <step-id>`: every attempt of that step across runs with run id, time, verdict, and a marker where the run used an earlier runbook hash.
   - `lori answer <file.lori> <var> [value]`: records an answer without running; a secret is read from the terminal, never an argument.
 - `TerminalOperator` prompts on `/dev/tty`, one `y/N` line per approval, printing the plan sentence.
 
-- [ ] **Step 1: Write failing CLI tests (use `assert_cmd` and `--no-sandbox` with fixture runbooks):** `validate_reports_used_before_set_and_exits_1`; `check_makes_no_history_writes_of_steps` (history gains only a check-run record, no `StepStarted`); `run_then_run_again_runs_no_scripts`; `history_shows_every_attempt_across_runs`; `history_marks_attempts_from_earlier_runbook_version` (edit the file between runs); `secret_answer_not_accepted_as_argument`; `from_unknown_step_exits_2_with_message`; `ctrl_c_midstep_records_interrupted` (send SIGINT to the child; history shows `interrupted`, not an open attempt).
+- [ ] **Step 1: Write failing CLI tests (use `assert_cmd`; fixture runbooks set `target: local` so they run without bubblewrap):** `validate_reports_used_before_set_and_exits_1`; `sandbox_only_refuses_a_local_target`; `status_and_history_show_each_attempts_target`; `check_makes_no_history_writes_of_steps` (history gains only a check-run record, no `StepStarted`); `run_then_run_again_runs_no_scripts`; `history_shows_every_attempt_across_runs`; `history_marks_attempts_from_earlier_runbook_version` (edit the file between runs); `secret_answer_not_accepted_as_argument`; `from_unknown_step_exits_2_with_message`; `ctrl_c_midstep_records_interrupted` (send SIGINT to the child; history shows `interrupted`, not an open attempt).
 - [ ] **Step 2: Run; expect failure.** **Step 3: Implement with `clap` derive. Install a SIGINT handler that sets a flag the runner's deadline loop polls.** **Step 4: Run; expect PASS.**
 - [ ] **Step 5: Commit** `feat(cli): lori command and terminal stepper`.
 
@@ -362,12 +369,12 @@ If `bwrap` is missing in the build environment, run `apt-get install -y bubblewr
 ### Task 11: Acceptance test from the worked example
 
 **Files:**
-- Create: `crates/lori-cli/tests/fixtures/infra.lori` (synthetic, 12 to 15 steps shaped like the worked example: preflight, create environment, create identity, role assignments, DNS records, variables, pipeline registration, a waiting "has the run finished?" manual step, a tag push, certificate creation, a final by-hand checklist), `crates/lori-cli/tests/fixtures/bin/{az,git,curl,dig}` (stubs that keep their "cloud" in a state directory), `crates/lori-cli/tests/acceptance.rs`
+- Create: `crates/lori-cli/tests/fixtures/infra.lori` (default `target: local` so the stubs on `PATH` are visible; synthetic, 12 to 15 steps shaped like the worked example: preflight, create environment, create identity, role assignments, DNS records, variables, pipeline registration, a waiting "has the run finished?" manual step, a tag push, certificate creation, a final by-hand checklist), `crates/lori-cli/tests/fixtures/bin/{az,git,curl,dig}` (stubs that keep their "cloud" in a state directory), `crates/lori-cli/tests/acceptance.rs`
 - Create: `docs/superpowers/notes/2026-11-26-acceptance-mapping.md` (how each script idiom maps to the model, and what did not fit)
 
 **Interfaces:** consumes the `lori` binary. No client names, ids or hostnames in any fixture.
 
-- [ ] **Step 1: Write the acceptance tests, one per line of spec section 10:** `rerun_with_all_checks_passing_runs_no_scripts`; `failing_check_runs_step_then_rechecks`; `check_command_changes_nothing_and_asks_nothing`; `start_at_late_step_pulls_in_the_setter` (the fixture has a late step using a variable set by an early question); `changing_a_variable_stales_exactly_its_dependents`; `injected_credential_present_in_env_absent_from_history_and_args` (credential via `--cred TOKEN='echo s3cret-value'`; grep the whole `.lori_history` directory bytes for the value: absent); `undeclared_network_is_denied` (needs the real sandbox; ignored with reason when unavailable); `kill_mid_run_then_resume` (SIGKILL the `lori` process during a step; rerun; history is intact and the run resumes from the first failing check).
+- [ ] **Step 1: Write the acceptance tests, one per line of spec section 10:** `rerun_with_all_checks_passing_runs_no_scripts`; `failing_check_runs_step_then_rechecks`; `check_command_changes_nothing_and_asks_nothing`; `start_at_late_step_pulls_in_the_setter` (the fixture has a late step using a variable set by an early question); `changing_a_variable_stales_exactly_its_dependents`; `injected_credential_present_in_env_absent_from_history_and_args` (credential via `--cred TOKEN='echo s3cret-value'`; grep the whole `.lori_history` directory bytes for the value: absent); `undeclared_network_is_denied` (needs the real sandbox; ignored with reason when unavailable); `token_from_secret_output_reaches_later_step_and_is_absent_from_history` (the stub `az account get-access-token` prints JSON; an `outputs` rule with `secret: true` and a JSON path takes `accessToken`; a later step uses `${TOKEN}` and echoes it; the whole `.lori_history` directory contains neither the token nor the echoed value); `sandbox_only_refuses_the_fixture_because_it_uses_local`; `kill_mid_run_then_resume` (SIGKILL the `lori` process during a step; rerun; history is intact and the run resumes from the first failing check).
 - [ ] **Step 2: Build the fixture and stubs until each test fails for the right reason, then until it passes.** Record in the mapping note every idiom that was awkward (shared helper functions, multi-part steps, waiting steps), as input to phase 2.
 - [ ] **Step 3: `cargo test --workspace`; expect PASS** (sandbox-dependent tests may be skipped with the printed reason; say which in the note).
 - [ ] **Step 4: Commit** `test: acceptance suite from the worked example`.
